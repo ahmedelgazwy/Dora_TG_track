@@ -94,8 +94,8 @@ class BaseTrainer:
                     if epoch > (max_epochs - 10) or save_every_epoch or epoch % 40 == 0:
                     # if epoch > (max_epochs - 10) or save_every_epoch or epoch % 100 == 0:
                         if self._checkpoint_dir:
-                            if self.settings.local_rank in [-1, 0]:
-                                self.save_checkpoint()
+                            # if self.settings.local_rank in [-1, 0]:
+                            self.save_checkpoint()
             except:
                 print('Training crashed at epoch {}'.format(epoch))
                 if fail_safe:

@@ -26,19 +26,19 @@ DATA:
     - GOT10K_train_full
     DATASETS_RATIO:
     - 1
-    SAMPLE_PER_EPOCH: 30000
+    SAMPLE_PER_EPOCH: 60000
   VAL:
     DATASETS_NAME:
     - GOT10K_official_val
     DATASETS_RATIO:
     - 1
-    SAMPLE_PER_EPOCH: 5000
+    SAMPLE_PER_EPOCH: 10000
 MODEL:
   PRETRAIN_FILE: "mae_pretrain_vit_base.pth"
   EXTRA_MERGER: False
   RETURN_INTER: False
   BACKBONE:
-    TYPE: vit_base_patch16_224_ce
+    TYPE: vit_base_patch16_224
     STRIDE: 16
     CE_LOC: [3, 6, 9]
     CE_KEEP_RATIO: [0.7, 0.7, 0.7]
@@ -48,6 +48,8 @@ MODEL:
   HEAD:
     TYPE: CENTER
     NUM_CHANNELS: 256
+  APN:
+    USE: True
 
 TRAIN:
   BBOX_TASK: True
@@ -56,11 +58,13 @@ TRAIN:
   CE_START_EPOCH: 20  # candidate elimination start epoch
   CE_WARM_EPOCH: 50  # candidate elimination warm up epoch
   BATCH_SIZE: 8
-  NUM_WORKER: 10
-  EPOCH: 100
+  NUM_WORKER: 4
+  EPOCH: 120
   LR_DROP_EPOCH: 80
   GIOU_WEIGHT: 2.0
   L1_WEIGHT: 5.0
+  PERCEPTUAL_WEIGHT: 0.3
+  L1_APPEARANCE_WEIGHT: 0.3
   GRAD_CLIP_NORM: 0.1
   LR: 0.0001
   OPTIMIZER: ADAMW
@@ -72,7 +76,7 @@ TRAIN:
   WEIGHT_DECAY: 0.0001
   AMP: False
 TEST:
-  EPOCH: 100
+  EPOCH: 120
   SEARCH_FACTOR: 5.0
   SEARCH_SIZE: 384
   TEMPLATE_FACTOR: 2.0

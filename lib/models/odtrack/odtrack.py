@@ -1,3 +1,5 @@
+# In lib/models/odtrack/odtrack.py
+
 import math
 import os
 from typing import List
@@ -10,12 +12,15 @@ from lib.models.layers.head import build_box_head
 from lib.models.odtrack.vit import vit_base_patch16_224, vit_large_patch16_224
 from lib.models.odtrack.vit_ce import vit_large_patch16_224_ce, vit_base_patch16_224_ce
 from lib.utils.box_ops import box_xyxy_to_cxcywh
+# --- START OF MODIFICATION ---
+from .apn import AppearancePredictionNetwork
+# --- END OF MODIFICATION ---
 
 
 class ODTrack(nn.Module):
     """ This is the base class for MMTrack """
 
-    def __init__(self, transformer, box_head, aux_loss=False, head_type="CORNER", token_len=1):
+    def __init__(self, transformer, box_head, cfg, aux_loss=False, head_type="CORNER", token_len=1): # Modified to accept cfg
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture.
@@ -24,6 +29,13 @@ class ODTrack(nn.Module):
         super().__init__()
         self.backbone = transformer
         self.box_head = box_head
+        # --- START OF MODIFICATION ---
+        # Instantiate the Appearance Prediction Network (APN) if enabled in the config
+        if getattr(cfg.MODEL, "APN", None) and cfg.MODEL.APN.USE:
+            self.apn = AppearancePredictionNetwork(cfg)
+        else:
+            self.apn = None
+        # --- END OF MODIFICATION ---
 
         self.aux_loss = aux_loss
         self.head_type = head_type
@@ -43,12 +55,32 @@ class ODTrack(nn.Module):
                 ce_template_mask=None,
                 ce_keep_rate=None,
                 return_last_attn=False,
+                # --- START OF MODIFICATION ---
+                template_history: List[torch.Tensor] = None # New argument for APN
+                # --- END OF MODIFICATION ---
                 ):
         assert isinstance(search, list), "The type of search is not List"
 
+        # --- START OF MODIFICATION ---
+        # If APN is used, predict the template for the current frame
+        # Otherwise, use the latest template from history (original behavior)
+        if self.apn is not None and template_history is not None:
+            predicted_template = self.apn(template_history)
+            # print("Temp.shape", predicted_template.shape)
+            # The backbone expects a list of templates. We provide our single predicted template.
+            template_for_backbone = [predicted_template]
+        else:
+            # Fallback to original behavior if APN is not used
+            predicted_template = None 
+            template_for_backbone = template
+        # --- END OF MODIFICATION ---
+
         out_dict = []
         for i in range(len(search)):
-            x, aux_dict = self.backbone(z=template.copy(), x=search[i],
+            # --- START OF MODIFICATION ---
+            # Use the template determined above (either predicted or from input)
+            x, aux_dict = self.backbone(z=template_for_backbone, x=search[i],
+            # --- END OF MODIFICATION ---
                                         ce_template_mask=ce_template_mask, ce_keep_rate=ce_keep_rate,
                                         return_last_attn=return_last_attn, track_query=self.track_query, token_len=self.token_len)
             feat_last = x
@@ -67,6 +99,12 @@ class ODTrack(nn.Module):
 
             out.update(aux_dict)
             out['backbone_feat'] = x
+            
+            # --- START OF MODIFICATION ---
+            # Add the predicted template to the output dict for loss calculation in the Actor
+            if predicted_template is not None:
+                out['predicted_template'] = predicted_template
+            # --- END OF MODIFICATION ---
             
             out_dict.append(out)
             
@@ -153,6 +191,9 @@ def build_odtrack(cfg, training=True):
     model = ODTrack(
         backbone,
         box_head,
+        # --- START OF MODIFICATION ---
+        cfg=cfg,  # Pass the full config to the model
+        # --- END OF MODIFICATION ---
         aux_loss=False,
         head_type=cfg.MODEL.HEAD.TYPE,
         token_len=cfg.MODEL.BACKBONE.TOKEN_LEN,

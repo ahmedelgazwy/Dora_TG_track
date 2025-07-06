@@ -1,3 +1,5 @@
+# In train_script.py
+
 import os
 # loss function related
 from lib.utils.box_ops import giou_loss, iouhead_loss
@@ -18,10 +20,13 @@ from lib.train.actors import ODTrackActor
 import importlib
 
 from ..utils.focal_loss import FocalLoss
+# --- START OF MODIFICATION ---
+import lpips
+# --- END OF MODIFICATION ---
 
 
 def run(settings):
-    settings.description = 'Training script for STARK-S, STARK-ST stage1, and STARK-ST stage2'
+    settings.description = 'Training script for ODTrack with Appearance Prediction Network'
 
     # update the default configs with config file
     if not os.path.exists(settings.cfg_file):
@@ -60,7 +65,6 @@ def run(settings):
     # wrap networks to distributed one
     net.cuda()
     if settings.local_rank != -1:
-        # net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)  # add syncBN converter
         net = DDP(net, device_ids=[settings.local_rank], find_unused_parameters=True)
         settings.device = torch.device("cuda:%d" % settings.local_rank)
     else:
@@ -73,15 +77,51 @@ def run(settings):
     # Loss functions and Actors
     if settings.script_name == "odtrack":
         focal_loss = FocalLoss()
+        # --- START OF MODIFICATION ---
+        # Initialize perceptual loss and add new objectives and weights
         objective = {'giou': giou_loss, 'l1': l1_loss, 'focal': focal_loss, 'cls': BCEWithLogitsLoss()}
         loss_weight = {'giou': cfg.TRAIN.GIOU_WEIGHT, 'l1': cfg.TRAIN.L1_WEIGHT, 'focal': 1.0, 'cls': 1.0}
+        
+        # Add appearance prediction losses if APN is used
+        if getattr(cfg.MODEL, "APN", None) and cfg.MODEL.APN.USE:
+            perceptual_loss_fn = lpips.LPIPS(net='vgg').to(settings.device)
+            objective['l1_appearance'] = l1_loss
+            objective['perceptual'] = perceptual_loss_fn
+            loss_weight['l1_appearance'] = cfg.TRAIN.L1_APPEARANCE_WEIGHT
+            loss_weight['perceptual'] = cfg.TRAIN.PERCEPTUAL_WEIGHT
+        # --- END OF MODIFICATION ---
         actor = ODTrackActor(net=net, objective=objective, loss_weight=loss_weight, settings=settings, cfg=cfg)
     else:
         raise ValueError("illegal script name")
 
+    # --- START OF MODIFICATION ---
+    # Optimizer, parameters, and learning rates with staged training
+    train_stage = getattr(cfg.TRAIN, "TRAIN_STAGE", "e2e")
+    
+    if train_stage == 'apn_only':
+        print("TRAINING STAGE: Appearance Prediction Network (APN) ONLY")
+        # Freeze all parameters first
+        for name, param in net.named_parameters():
+            param.requires_grad = False
+        # Unfreeze only the APN parameters
+        for name, param in net.named_parameters():
+            if "apn" in name:
+                param.requires_grad = True
+                if settings.local_rank in [-1, 0]:
+                    print(f"Unfreezing: {name}")
+    elif train_stage == 'e2e':
+        print("TRAINING STAGE: End-to-End (E2E)")
+        # Ensure all parameters are trainable
+        for param in net.parameters():
+            param.requires_grad = True
+    else:
+        raise ValueError(f"Unknown training stage: {train_stage}. Must be 'apn_only' or 'e2e'.")
+        
+    param_dicts = [p for p in net.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(param_dicts, lr=cfg.TRAIN.LR, weight_decay=cfg.TRAIN.WEIGHT_DECAY)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, cfg.TRAIN.LR_DROP_EPOCH)
+    # --- END OF MODIFICATION ---
 
-    # Optimizer, parameters, and learning rates
-    optimizer, lr_scheduler = get_optimizer_scheduler(net, cfg, settings)
     use_amp = getattr(cfg.TRAIN, "AMP", False)
     trainer = LTRTrainer(actor, [loader_train, loader_val], optimizer, settings, lr_scheduler, use_amp=use_amp)
 
