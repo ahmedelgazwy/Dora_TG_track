@@ -1,9 +1,10 @@
+# In train_script.py
+
 import os
 # loss function related
-from lib.utils.box_ops import giou_loss, iouhead_loss
+from lib.utils.box_ops import giou_loss
 from torch.nn.functional import l1_loss
 from torch.nn import BCEWithLogitsLoss
-
 # train pipeline related
 from lib.train.trainers import LTRTrainer
 # distributed training related
@@ -18,10 +19,14 @@ from lib.train.actors import ODTrackActor
 import importlib
 
 from ..utils.focal_loss import FocalLoss
+# --- START OF MODIFICATION ---
+# lpips is no longer needed
+# import lpips
+# --- END OF MODIFICATION ---
 
 
 def run(settings):
-    settings.description = 'Training script for STARK-S, STARK-ST stage1, and STARK-ST stage2'
+    settings.description = 'Training script for ODTrack with DoRA-based Appearance Prediction'
 
     # update the default configs with config file
     if not os.path.exists(settings.cfg_file):
@@ -60,7 +65,7 @@ def run(settings):
     # wrap networks to distributed one
     net.cuda()
     if settings.local_rank != -1:
-        # net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)  # add syncBN converter
+        # The DoRA_APN is frozen, so find_unused_parameters can be helpful
         net = DDP(net, device_ids=[settings.local_rank], find_unused_parameters=True)
         settings.device = torch.device("cuda:%d" % settings.local_rank)
     else:
@@ -73,15 +78,25 @@ def run(settings):
     # Loss functions and Actors
     if settings.script_name == "odtrack":
         focal_loss = FocalLoss()
+        # --- START OF MODIFICATION ---
+        # The objective now only contains tracking-related losses
         objective = {'giou': giou_loss, 'l1': l1_loss, 'focal': focal_loss, 'cls': BCEWithLogitsLoss()}
         loss_weight = {'giou': cfg.TRAIN.GIOU_WEIGHT, 'l1': cfg.TRAIN.L1_WEIGHT, 'focal': 1.0, 'cls': 1.0}
+        # --- END OF MODIFICATION ---
         actor = ODTrackActor(net=net, objective=objective, loss_weight=loss_weight, settings=settings, cfg=cfg)
     else:
         raise ValueError("illegal script name")
 
+    # --- START OF MODIFICATION ---
+    # Optimizer setup is now simplified.
+    # The staged training logic is removed as the DoRA_APN is always frozen.
+    # The optimizer will only receive parameters that require gradients.
+    print("Setting up optimizer for End-to-End training (DoRA_APN is frozen).")
+    param_dicts = [p for p in net.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(param_dicts, lr=cfg.TRAIN.LR, weight_decay=cfg.TRAIN.WEIGHT_DECAY)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, cfg.TRAIN.LR_DROP_EPOCH)
+    # --- END OF MODIFICATION ---
 
-    # Optimizer, parameters, and learning rates
-    optimizer, lr_scheduler = get_optimizer_scheduler(net, cfg, settings)
     use_amp = getattr(cfg.TRAIN, "AMP", False)
     trainer = LTRTrainer(actor, [loader_train, loader_val], optimizer, settings, lr_scheduler, use_amp=use_amp)
 

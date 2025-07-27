@@ -147,8 +147,8 @@ class CenterPredictor(nn.Module, ):
 
     def forward(self, x, gt_score_map=None):
         """ Forward pass with input x. x.shape:(B, C, H, W) """
+        # with autocast(device_type="cuda", enabled=False):
         score_map_ctr, size_map, offset_map = self.get_score_map(x)
-
         # assert gt_score_map is None
         if gt_score_map is None:
             bbox = self.cal_bbox(score_map_ctr, size_map, offset_map)

@@ -26,19 +26,19 @@ DATA:
     - GOT10K_train_full
     DATASETS_RATIO:
     - 1
-    SAMPLE_PER_EPOCH: 30000
+    SAMPLE_PER_EPOCH: 60000
   VAL:
     DATASETS_NAME:
     - GOT10K_official_val
     DATASETS_RATIO:
     - 1
-    SAMPLE_PER_EPOCH: 5000
+    SAMPLE_PER_EPOCH: 10000
 MODEL:
   PRETRAIN_FILE: "mae_pretrain_vit_base.pth"
   EXTRA_MERGER: False
   RETURN_INTER: False
   BACKBONE:
-    TYPE: vit_base_patch16_224_ce
+    TYPE: vit_base_patch16_224
     STRIDE: 16
     CE_LOC: [3, 6, 9]
     CE_KEEP_RATIO: [0.7, 0.7, 0.7]
