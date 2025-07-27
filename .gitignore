@@ -1,3 +1,5 @@
-/output
-__pycache__
+__pycache__/
+output/
+pretrained_networks
+tensorboard/train/odtrack
 *.pth

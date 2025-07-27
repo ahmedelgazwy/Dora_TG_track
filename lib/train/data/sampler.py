@@ -147,30 +147,35 @@ class TrackingSampler(torch.utils.data.Dataset):
                 elif self.frame_sample_mode == "stark":
                     template_frame_ids, search_frame_ids = self.get_frame_ids_stark(visible, seq_info_dict["valid"])
                 else:
-                    raise ValueError("Illegal frame sample mode")
+                    raise ValueError("Only 'causal' frame sample mode is supported for this implementation.")
             else:
                 # In case of image dataset, just repeat the image to generate synthetic video
                 template_frame_ids = [1] * self.num_template_frames
                 search_frame_ids = [1] * self.num_search_frames
             try:
                 template_frames, template_anno, meta_obj_train = dataset.get_frames(seq_id, template_frame_ids, seq_info_dict)
-                search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
+                
+                # --- START OF FIX ---
+                # Use the new method to get search frames and their raw versions
+                search_frames, search_anno_dict, meta_obj_test = dataset.get_search_frames(seq_id, search_frame_ids)
 
-                H, W, _ = template_frames[0].shape
-                # generate mask matrix
-                template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros((H, W))] * self.num_template_frames
-                search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros((H, W))] * self.num_search_frames
+                template_data = TensorDict({
+                    'images': template_frames,
+                    'anno': template_anno['bbox'],
+                })
 
-                data = TensorDict({'template_images': template_frames,
-                                'template_anno': template_anno['bbox'],
-                                'template_masks': template_masks,
-                                'search_images': search_frames,  # ori image
-                                'search_anno': search_anno['bbox'],
-                                'search_masks': search_masks,
-                                'dataset': dataset.get_name(),
-                                'test_class': meta_obj_test.get('object_class_name'),
-                                'exp_str': meta_obj_train.get('exp_str') if 'exp_str' in meta_obj_train else None,
-                                })
+                search_data = TensorDict({
+                    'images': search_frames,
+                    'anno': search_anno_dict['bbox'],
+                    'raw_search_frames': search_anno_dict['raw_search_frames'] # Keep raw frames here
+                })
+                
+                data = TensorDict({
+                    'template': template_data,
+                    'search': search_data,
+                    'dataset': dataset.get_name(),
+                })
+                # --- END OF FIX ---
                 
                 # make data augmentation
                 data = self.processing(data)

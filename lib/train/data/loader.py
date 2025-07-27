@@ -4,6 +4,7 @@ import importlib
 import collections
 # from torch._six import string_classes
 from lib.utils import TensorDict, TensorList
+import numpy as np
 
 if float(torch.__version__[:3]) >= 1.9 or len('.'.join((torch.__version__).split('.')[0:2])) > 3:
     int_classes = int
@@ -57,6 +58,22 @@ def ltr_collate(batch):
     elif isinstance(batch[0], string_classes):
         return batch
     elif isinstance(batch[0], TensorDict):
+        # --- START OF FIX ---
+        # Handle the case where raw_search_frames are inside the 'search' TensorDict
+        if 'search' in batch[0] and isinstance(batch[0]['search'], collections.Mapping) and 'raw_search_frames' in batch[0]['search']:
+            # Extract the list of lists of raw frames
+            raw_frames_list_of_lists = [d['search'].pop('raw_search_frames') for d in batch]
+            
+            # Collate the rest of the TensorDict normally
+            collated_td = TensorDict({key: ltr_collate([d[key] for d in batch]) for key in batch[0]})
+            
+            # Stack the raw frames: 
+            # 1. Stack inner lists into (NumSearch, C, H, W) tensors
+            # 2. Stack the batch of these tensors into (Batch, NumSearch, C, H, W)
+            collated_raw_frames = torch.stack([torch.stack(raw_list, 0) for raw_list in raw_frames_list_of_lists], 0)
+            collated_td['search']['raw_search_frames'] = collated_raw_frames
+            return collated_td
+        # --- END OF FIX ---
         return TensorDict({key: ltr_collate([d[key] for d in batch]) for key in batch[0]})
     elif isinstance(batch[0], collections.Mapping):
         return {key: ltr_collate([d[key] for d in batch]) for key in batch[0]}
