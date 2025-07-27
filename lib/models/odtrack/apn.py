@@ -171,19 +171,20 @@ class DoRA_APN(nn.Module):
         msg = model.load_state_dict(state_dict, strict=False)
         print(f"DoRA weights loaded with msg: {msg}")
 
-    def forward(self, last_template_img, search_frame, return_viz=False):
+    def forward(self, last_template_img, batched_raw_search_frames, return_viz=False):
         """
-        Predicts the appearance of the object from `last_template_img` in the `search_frame`.
+        Predicts templates for a batch of search frames in parallel.
+        Args:
+            last_template_img (Tensor): (B, C, H_t, W_t)
+            batched_raw_search_frames (Tensor): (B, NumSearch, C, H_s, W_s)
         """
         with torch.no_grad():
-            # The DoRA teacher expects a list of images (for multi-crop), so we wrap our tensors in lists
-            # We also only care about the backbone output, not the DINO head, so we call it directly
+            B, Ns, C, Hs, Ws = batched_raw_search_frames.shape
             
-            # --- Step 1: Discover object prototypes from the template image ---
+            # Step 1: Discover object prototype from the single template image (once per batch)
             _, template_patches, template_attn, template_query, _ = self.teacher.backbone(last_template_img)
             
             H_t, W_t = last_template_img.shape[-2] // self.patch_size, last_template_img.shape[-1] // self.patch_size
-            num_template_patches = H_t * W_t
             
             # Use attention from CLS token to all patches
             cls_attn_heads = template_attn[:, :, 0, 1:]
@@ -193,11 +194,7 @@ class DoRA_APN(nn.Module):
             chosen_heads = random.sample(range(cls_attn_heads.shape[1]), num_heads_to_use)
             random_attn_heads = cls_attn_heads[:, chosen_heads, :]
 
-            # Extract corresponding query vectors for the template
-            template_query_patches = template_query[:, :, 1:, :] # (B, num_heads, num_patches, head_dim)
-            template_query_patches = rearrange(template_query_patches, 'b h n d -> b n (h d)') # (B, num_patches, embed_dim)
-
-            # Create initial object prototypes
+            template_query_patches = rearrange(template_query[:, :, 1:, :], 'b h n d -> b n (h d)')
             obj_prototypes = torch.einsum('bkn, bnd -> bkd', random_attn_heads, template_query_patches)
 
             # Refine prototypes using Sinkhorn-Knopp
@@ -209,61 +206,61 @@ class DoRA_APN(nn.Module):
             center_patch_idx = (H_t // 2) * W_t + (W_t // 2)
             # Find which object query (k) has the max value for the center patch column
             _, target_object_idx = torch.max(assignment_opt[:, center_patch_idx, :], dim=1)
+            target_assignment = assignment_opt[torch.arange(B), :, target_object_idx].unsqueeze(1)
+            refined_target_prototype = target_assignment @ normalized_features
 
-            # Use the refined assignment to create a clean prototype for the target object
-            target_assignment = assignment_opt[torch.arange(assignment_opt.shape[0]), :, target_object_idx].unsqueeze(1) # (B, 1, num_patches)
-            refined_target_prototype = target_assignment @ normalized_features # (B, 1, embed_dim)
+            # Step 2: Process all search frames in a single large batch
+            search_frames_flat = batched_raw_search_frames.view(B * Ns, C, Hs, Ws)
+            _, _, _, _, search_key_flat = self.teacher.backbone(search_frames_flat)
+            search_key_patches_flat = search_key_flat[:, :, 1:, :]
 
-            # --- Step 3: Track the selected object in the search frame ---
-            _, _, _, _, search_key = self.teacher.backbone(search_frame)
-            search_key_patches = search_key[:, :, 1:, :] # (B, num_heads, num_search_patches, head_dim)
-
-            # Perform cross-attention: (target_prototype) x (search_key)
-            # We need to reshape the prototype to match head dimension for attention
-            B, _, D = refined_target_prototype.shape
-            num_heads = search_key_patches.shape[1]
+            # Step 3: Batched Cross-Attention
+            # Repeat the prototype for each search frame in the sequence
+            target_prototype_repeated = refined_target_prototype.repeat_interleave(Ns, dim=0)
+            
+            _, _, D = target_prototype_repeated.shape
+            num_heads = search_key_patches_flat.shape[1]
             head_dim = D // num_heads
             
-            proto_reshaped = refined_target_prototype.view(B, 1, num_heads, head_dim).permute(0,2,1,3) # (B, num_heads, 1, head_dim)
-            
-            track_attn = (proto_reshaped @ search_key_patches.transpose(-2,-1)) * (head_dim ** -0.5) # (B, num_heads, 1, num_search_patches)
-            
-            # Average attention across heads and apply softmax
-            track_mask = track_attn.mean(dim=1).softmax(dim=-1) # (B, 1, num_search_patches)
+            proto_reshaped = target_prototype_repeated.view(B * Ns, 1, num_heads, head_dim).permute(0, 2, 1, 3)
+            track_attn = (proto_reshaped @ search_key_patches_flat.transpose(-2, -1)) * (head_dim ** -0.5)
+            track_mask_flat = track_attn.mean(dim=1).softmax(dim=-1)
 
-            # --- Step 4: Generate the predicted template by cropping ---
-            H_s, W_s = search_frame.shape[-2] // self.patch_size, search_frame.shape[-1] // self.patch_size
-            track_mask_reshaped = track_mask.view(-1, 1, H_s, W_s)
+            # Step 4: Batched Cropping and Resizing
+            H_s_p, W_s_p = Hs // self.patch_size, Ws // self.patch_size
+            track_mask_reshaped = track_mask_flat.view(B * Ns, 1, H_s_p, W_s_p)
+            upsampled_mask_flat = F.interpolate(track_mask_reshaped, size=(Hs, Ws), mode='bilinear')
             
-            # Upsample mask to the size of the search frame
-            upsampled_mask = F.interpolate(track_mask_reshaped, size=search_frame.shape[-2:], mode='bilinear')
-            
-            # Binarize the mask and find bounding box
-            predicted_templates = []
-            for i in range(upsampled_mask.shape[0]):
-                single_mask = upsampled_mask[i, 0]
-                threshold = single_mask.mean() # Simple thresholding
+            all_predicted_templates = []
+            for i in range(B * Ns):
+                single_mask = upsampled_mask_flat[i, 0]
+                threshold = torch.quantile(single_mask, 0.9)
                 binary_mask = (single_mask > threshold).cpu()
                 
                 # Get bounding box from the binary mask
                 rows = torch.any(binary_mask, axis=1)
                 cols = torch.any(binary_mask, axis=0)
-                if not (torch.any(rows) and torch.any(cols)): # Handle empty mask case
-                    predicted_templates.append(resize(last_template_img[i], self.cfg.DATA.TEMPLATE.SIZE))
+                if not (torch.any(rows) and torch.any(cols)):
+                    # Fallback: use a resized version of the original input template
+                    original_template_idx = i // Ns
+                    fallback_template = resize(last_template_img[original_template_idx], (self.cfg.DATA.TEMPLATE.SIZE, self.cfg.DATA.TEMPLATE.SIZE))
+                    all_predicted_templates.append(fallback_template)
                     continue
 
                 ymin, ymax = torch.where(rows)[0][[0, -1]]
                 xmin, xmax = torch.where(cols)[0][[0, -1]]
                 
-                # Crop the search frame and resize to template size
-                predicted_crop = crop(search_frame[i], ymin, xmin, ymax - ymin, xmax - xmin)
+                predicted_crop = crop(search_frames_flat[i], ymin, xmin, ymax - ymin, xmax - xmin)
                 predicted_template = resize(predicted_crop, (self.cfg.DATA.TEMPLATE.SIZE, self.cfg.DATA.TEMPLATE.SIZE))
-                predicted_templates.append(predicted_template)
-            final_predicted_template = torch.stack(predicted_templates)
+                all_predicted_templates.append(predicted_template)
+
+            # Reshape back to (B, Ns, C, H_t, W_t)
+            final_predicted_templates = torch.stack(all_predicted_templates).view(B, Ns, C, self.cfg.DATA.TEMPLATE.SIZE, self.cfg.DATA.TEMPLATE.SIZE)
+
             if return_viz:
-                viz_data = {'upsampled_mask': upsampled_mask}
-                print('RETURNING VIS DATA')
-                return final_predicted_template, viz_data
+                # Reshape masks for visualization as well
+                upsampled_masks = upsampled_mask_flat.view(B, Ns, 1, Hs, Ws)
+                viz_data = {'upsampled_masks': upsampled_masks} # Note the plural 'masks'
+                return final_predicted_templates, viz_data
             
-            return final_predicted_template
-            
+            return final_predicted_templates

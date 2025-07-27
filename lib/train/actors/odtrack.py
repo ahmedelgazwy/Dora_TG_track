@@ -7,16 +7,12 @@ import torch
 from lib.utils.merge import merge_template_search
 from ...utils.heapmap_utils import generate_heatmap
 from ...utils.ce_utils import generate_mask_cond, adjust_keep_rate
-# --- START OF MODIFICATION ---
-# These imports are no longer needed for loss calculation here
-# from torchvision.transforms.functional import crop, resize
-# --- END OF MODIFICATION ---
-# --- START OF VISUALIZATION MODIFICATION ---
 import os
 import torchvision
 from torchvision.transforms.functional import crop, resize
 from pathlib import Path
-# --- END OF VISUALIZATION MODIFICATION ---
+
+
 class ODTrackActor(BaseActor):
     """ Actor for training ODTrack models """
 
@@ -54,55 +50,43 @@ class ODTrackActor(BaseActor):
             self.save_visualization(out_dict, data)
         return loss, status
 
-    def forward_pass(self, data,run_viz=False):
-        # The ODTrack model expects a list of templates.
-        # The number of historical templates is defined by cfg.DATA.TEMPLATE.NUM_HISTORY
-        template_list = [data['template_images'][i].view(-1, *data['template_images'].shape[2:])
-                         for i in range(self.settings.num_template)]
-
-        search_list = [data['search_images'][i].view(-1, *data['search_images'].shape[2:])
-                       for i in range(self.settings.num_search)]
+    def forward_pass(self, data, run_viz=False):
+        # --- START OF FIX ---
+        # Data is now nested in 'template' and 'search' keys
+        template_data = data['template']
+        search_data = data['search']
+        
+        template_list = template_data['images']
+        search_list = search_data['images']
+        raw_search_frames = search_data.get('raw_search_frames')
+        # --- END OF FIX ---
             
-        box_mask_z = []
-        ce_keep_rate = None
-        if self.cfg.MODEL.BACKBONE.CE_LOC:
-            box_mask_z = [generate_mask_cond(self.cfg, img.shape[0], img.device, anno)
-                          for img, anno in zip(template_list, data['template_anno'])]
-            box_mask_z = torch.cat(box_mask_z, dim=1) if box_mask_z else None
+        box_mask_z = None # Not implemented in this simplified flow
+        ce_keep_rate = None # Not implemented in this simplified flow
 
-            ce_start_epoch = self.cfg.TRAIN.CE_START_EPOCH
-            ce_warm_epoch = self.cfg.TRAIN.CE_WARM_EPOCH
-            ce_keep_rate = adjust_keep_rate(data['epoch'], warmup_epochs=ce_start_epoch,
-                                                total_epochs=ce_start_epoch + ce_warm_epoch,
-                                                ITERS_PER_EPOCH=1,
-                                                base_keep_rate=self.cfg.MODEL.BACKBONE.CE_KEEP_RATIO[0])
-
-        # --- START OF MODIFICATION ---
-        # Pass the historical templates to the network. The network itself will decide if/how to use the APN.
         out_dict = self.net(template=template_list,
                             search=search_list,
                             ce_template_mask=box_mask_z,
                             ce_keep_rate=ce_keep_rate,
                             return_last_attn=False,
                             template_history=template_list,
-                            # --- START OF VISUALIZATION MODIFICATION ---
-                            run_apn_viz=run_viz)
-                            # --- END OF VISUALIZATION MODIFICATION ---
-        # --- END OF MODIFICATION ---
+                            run_apn_viz=run_viz,
+                            raw_search_frames_for_apn=raw_search_frames)
 
         return out_dict
 
     def compute_losses(self, pred_dict, gt_dict, return_status=True):
+        # The logic here is already correct as it loops through the list of predictions
+        # ... (This function remains unchanged)
         assert isinstance(pred_dict, list)
         loss_dict = {}
         total_status = {}
-        total_loss = torch.tensor(0., dtype=torch.float, device=gt_dict['search_images'][0].device)
+        total_loss = torch.tensor(0., dtype=torch.float, device=gt_dict['search']['images'][0].device)
         
-        gt_gaussian_maps_list = generate_heatmap(gt_dict['search_anno'], self.cfg.DATA.SEARCH.SIZE, self.cfg.MODEL.BACKBONE.STRIDE)
+        gt_gaussian_maps_list = generate_heatmap(gt_dict['search']['anno'], self.cfg.DATA.SEARCH.SIZE, self.cfg.MODEL.BACKBONE.STRIDE)
         
         for i in range(len(pred_dict)):
-            # get GT for tracking loss
-            gt_bbox = gt_dict['search_anno'][i]
+            gt_bbox = gt_dict['search']['anno'][i]
             gt_gaussian_maps = gt_gaussian_maps_list[i].unsqueeze(1)
 
             # Get predicted boxes for tracking loss
@@ -149,53 +133,46 @@ class ODTrackActor(BaseActor):
             return total_loss, total_status
         else:
             return total_loss
-     # --- START OF VISUALIZATION MODIFICATION ---
-    def save_visualization(self, pred_dict, gt_dict):
-        """Saves a grid of images for debugging the APN."""
-        i = 0
-        if 'predicted_template' not in pred_dict[i] or 'upsampled_mask' not in pred_dict[i]:
 
-            return
-
-        # --- START OF FIX ---
-        # Define a common size for visualization
-        viz_size = (384, 384)
-
-        # Get all tensors and move them to CPU
-        input_template = gt_dict['template_images'][-1][i].cpu()
-        search_frame = gt_dict['search_images'][0][i].cpu()
-        predicted_template = pred_dict[i]['predicted_template'][i].cpu()
-        upsampled_mask = pred_dict[i]['upsampled_mask'][i].cpu()
-
-        # Resize all tensors to the common visualization size
-        input_template_resized = resize(input_template, viz_size)
-        search_frame_resized = resize(search_frame, viz_size)
-        predicted_template_resized = resize(predicted_template, viz_size)
+    def save_visualization(self, pred_dict_list, gt_dict):
+        """Saves a grid of images for debugging the APN for each search frame."""
+        viz_size = (224, 224)
         
-        # The mask also needs resizing and conversion to 3-channel for stacking
-        mask_viz_resized = resize(upsampled_mask, viz_size).repeat(3, 1, 1)
+        # We visualize for the first item in the batch
+        batch_idx = 0
 
-        # Generate and resize the ground-truth template
-        search_image_gt = gt_dict['search_images'][i]
-        gt_bbox_xywh = gt_dict['search_anno'][i]
-        img_h, img_w = search_image_gt.shape[-2:]
-        gt_bbox_abs = box_xywh_to_xyxy(gt_bbox_xywh[i]) * torch.tensor([img_w, img_h, img_w, img_h], device=search_image_gt.device)
-        gt_crop = crop(search_image_gt[i], int(gt_bbox_abs[1]), int(gt_bbox_abs[0]), int(gt_bbox_abs[3]-gt_bbox_abs[1]), int(gt_bbox_abs[2]-gt_bbox_abs[0]))
-        gt_template_resized = resize(gt_crop, viz_size).cpu()
+        # Loop through each search frame's prediction
+        for i, pred_dict in enumerate(pred_dict_list):
+            if 'predicted_template' not in pred_dict or 'upsampled_mask' not in pred_dict:
+                continue
 
-        # Create the grid using the resized tensors
-        viz_grid = torch.stack([
-            input_template_resized,
-            search_frame_resized,
-            mask_viz_resized,
-            predicted_template_resized,
-            gt_template_resized
-        ])
-        # --- END OF FIX ---
+            # Get the input template (it's the same for all search frames in this sequence)
+            input_template = gt_dict['template']['images'][-1][batch_idx].cpu()
+            
+            # Get the specific raw search frame for this timestep
+            raw_search_frame = gt_dict['search']['raw_search_frames'][batch_idx, i].cpu()
+            
+            predicted_template = pred_dict['predicted_template'][batch_idx].cpu()
+            upsampled_mask = pred_dict['upsampled_mask'][batch_idx].cpu()
 
-        filepath = self.viz_dir / f"epoch_{gt_dict['epoch']}_iter_{self.iter}.png"
-        search_frame_path = self.viz_dir / f"search_for_epoch_{gt_dict['epoch']}_iter_{self.iter}.png"
-        mask_frame_path = self.viz_dir / f"mask_for_epoch_{gt_dict['epoch']}_iter_{self.iter}.png"
-        torchvision.utils.save_image(viz_grid, filepath, nrow=5, normalize=True, value_range=(0, 1))
-        torchvision.utils.save_image(upsampled_mask, mask_frame_path, nrow=1, normalize=True, value_range=(0, 1))
-        torchvision.utils.save_image(search_frame, search_frame_path, nrow=1, normalize=True, value_range=(0, 1))
+            # Resize all components
+            input_template_r = resize(input_template, viz_size)
+            search_frame_r = resize(raw_search_frame, viz_size)
+            predicted_template_r = resize(predicted_template, viz_size)
+            mask_viz_r = resize(upsampled_mask, viz_size).repeat(3, 1, 1)
+
+            # Generate GT template for this specific search frame
+            gt_bbox_xywh = gt_dict['search']['anno'][i][batch_idx]
+            img_h, img_w = raw_search_frame.shape[-2:]
+            gt_bbox_abs = box_xywh_to_xyxy(gt_bbox_xywh) * torch.tensor([img_w, img_h, img_w, img_h], device=gt_bbox_xywh.device)
+            gt_crop = crop(raw_search_frame, int(gt_bbox_abs[1]), int(gt_bbox_abs[0]), int(gt_bbox_abs[3]-gt_bbox_abs[1]), int(gt_bbox_abs[2]-gt_bbox_abs[0]))
+            gt_template_r = resize(gt_crop, viz_size).cpu()
+            
+            # Create and save the grid for this timestep
+            viz_grid = torch.stack([
+                input_template_r, search_frame_r, mask_viz_r, predicted_template_r, gt_template_r
+            ])
+            
+            # Add timestep index to filename
+            filepath = self.viz_dir / f"epoch_{gt_dict['epoch']}_iter_{self.iter}_frame_{i}.png"
+            torchvision.utils.save_image(viz_grid, filepath, nrow=5, normalize=True, value_range=(0, 1))
