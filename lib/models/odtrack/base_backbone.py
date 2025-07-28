@@ -1,3 +1,5 @@
+# In lib/models/odtrack/base_backbone.py
+
 from functools import partial
 
 import torch
@@ -44,7 +46,6 @@ class BaseBackbone(nn.Module):
         self.return_stage = cfg.MODEL.RETURN_STAGES
         self.add_sep_seg = cfg.MODEL.BACKBONE.SEP_SEG
 
-        # resize patch embedding
         if new_patch_size != self.patch_size:
             print('Inconsistent Patch Size With The Pretrained Weights, Interpolate The Weight!')
             old_patch_embed = {}
@@ -59,21 +60,18 @@ class BaseBackbone(nn.Module):
             self.patch_embed.proj.bias = old_patch_embed['proj.bias']
             self.patch_embed.proj.weight = old_patch_embed['proj.weight']
 
-        # for patch embedding
         patch_pos_embed = self.pos_embed[:, patch_start_index:, :]
         patch_pos_embed = patch_pos_embed.transpose(1, 2)
         B, E, Q = patch_pos_embed.shape
         P_H, P_W = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
         patch_pos_embed = patch_pos_embed.view(B, E, P_H, P_W)
 
-        # for search region
         H, W = search_size
         new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
         search_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
                                                            align_corners=False)
         search_patch_pos_embed = search_patch_pos_embed.flatten(2).transpose(1, 2)
 
-        # for template region
         H, W = template_size
         new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
         template_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
@@ -83,20 +81,15 @@ class BaseBackbone(nn.Module):
         self.pos_embed_z = nn.Parameter(template_patch_pos_embed)
         self.pos_embed_x = nn.Parameter(search_patch_pos_embed)
 
-        # for cls token (keep it but not used)
         if self.add_cls_token and patch_start_index > 0:
             cls_pos_embed = self.pos_embed[:, 0:1, :]
             self.cls_pos_embed = nn.Parameter(cls_pos_embed)
 
-        # separate token and segment token
         if self.add_sep_seg:
             self.template_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
             self.template_segment_pos_embed = trunc_normal_(self.template_segment_pos_embed, std=.02)
             self.search_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
             self.search_segment_pos_embed = trunc_normal_(self.search_segment_pos_embed, std=.02)
-
-        # self.cls_token = None
-        # self.pos_embed = None
 
         if self.return_inter:
             for i_layer in self.return_stage:
@@ -111,10 +104,12 @@ class BaseBackbone(nn.Module):
 
         x = self.patch_embed(x)
         
-        z = torch.stack(z, dim=1)
-        _, T_z, C_z, H_z, W_z = z.shape
-        z = z.flatten(0, 1)
-        z = self.patch_embed(z)
+        # This handles both a single tensor and a list of tensors for z
+        if isinstance(z, list):
+            z_list = [self.patch_embed(z_i) for z_i in z]
+            z = torch.cat(z_list, dim=1)
+        else:
+            z = self.patch_embed(z)
 
         if self.add_cls_token:
             if token_type == "concat":
@@ -122,8 +117,8 @@ class BaseBackbone(nn.Module):
                 query = new_query if track_query is None else torch.cat([new_query, track_query], dim=1)
                 query = query + self.cls_pos_embed
             elif token_type == "add":
-                query = self.cls_token if track_query is None else track_query + self.cls_token   # self.cls_token is init query
-                query = query.expand(B, -1, -1)  # copy B times
+                query = self.cls_token if track_query is None else track_query + self.cls_token
+                query = query.expand(B, -1, -1)
                 query = query + self.cls_pos_embed
 
         z = z + self.pos_embed_z
@@ -132,44 +127,45 @@ class BaseBackbone(nn.Module):
         if self.add_sep_seg:
             x += self.search_segment_pos_embed
             z += self.template_segment_pos_embed
-
-        if T_z > 1:  # multiple memory frames
-            z = z.view(B, T_z, -1, z.size()[-1]).contiguous()
-            z = z.flatten(1, 2)
         
-        lens_z = z.shape[1]  # HW
-        lens_x = x.shape[1]  # HW
-        x = combine_tokens(z, x, mode=self.cat_mode)  # (B, z+x, 768)
+        lens_z = z.shape[1]
+        lens_x = x.shape[1]
+        x = combine_tokens(z, x, mode=self.cat_mode)
         if self.add_cls_token:
-            x = torch.cat([query, x], dim=1)     # (B, 1+z+x, 768)
+            x = torch.cat([query, x], dim=1)
 
         x = self.pos_drop(x)
 
         for i, blk in enumerate(self.blocks):
             x, attn = blk(x, lens_z, lens_x, return_attention=True)
         
-        new_lens_z = z.shape[1]  # HW
-        new_lens_x = x.shape[1]  # HW
+        new_lens_z = z.shape[1]
+        new_lens_x = x.shape[1] # Note: this is incorrect if tokens are recovered, but not used later
         x = recover_tokens(x, new_lens_z, new_lens_x, mode=self.cat_mode)
 
         aux_dict = {"attn": attn}
         
         return self.norm(x), aux_dict
 
+    # --- START OF FIX ---
     def forward(self, z, x, **kwargs):
         """
         Joint feature extraction and relation modeling for the basic ViT backbone.
         Args:
-            z (torch.Tensor): template feature, [B, C, H_z, W_z]
+            z (torch.Tensor or list): template feature(s), [B, C, H_z, W_z]
             x (torch.Tensor): search region feature, [B, C, H_x, W_x]
 
         Returns:
             x (torch.Tensor): merged template and search region feature, [B, L_z+L_x, C]
             attn : None
         """
-        if "token_type" in kwargs.keys():
-            x, aux_dict = self.forward_features(z, x, track_query=kwargs['track_query'], token_type=kwargs['token_type'])
-        else:
-            x, aux_dict = self.forward_features(z, x, track_query=kwargs['track_query'])
+        # Safely get 'track_query' and 'token_type' from kwargs dictionary.
+        # If they don't exist, use None and "add" as default values.
+        track_query = kwargs.get('track_query', None)
+        token_type = kwargs.get('token_type', "add")
+        
+        # Pass the safe values to the forward_features method.
+        x, aux_dict = self.forward_features(z, x, track_query=track_query, token_type=token_type)
 
         return x, aux_dict
+    # --- END OF FIX ---

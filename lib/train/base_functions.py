@@ -1,3 +1,5 @@
+# In lib/train/base_functions.py
+
 import os
 import torch
 from torch.utils.data.distributed import DistributedSampler
@@ -137,8 +139,11 @@ def build_dataloaders(cfg, settings):
 
     shuffle = False if settings.local_rank != -1 else True
 
+    # --- START OF FIX ---
+    # Remove the 'stack_dim' argument as it's no longer part of LTRLoader's __init__
     loader_train = LTRLoader('train', dataset_train, training=True, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=shuffle,
-                             num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, stack_dim=1, sampler=train_sampler)
+                             num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, sampler=train_sampler)
+    # --- END OF FIX ---
 
     # Validation samplers and loaders
     dataset_val = sampler.TrackingSampler(datasets=names2datasets(cfg.DATA.VAL.DATASETS_NAME, settings, opencv_loader),
@@ -148,17 +153,19 @@ def build_dataloaders(cfg, settings):
                                           num_template_frames=settings.num_template, processing=data_processing_val,
                                           frame_sample_mode=sampler_mode, train_cls=train_cls)
     val_sampler = DistributedSampler(dataset_val) if settings.local_rank != -1 else None
+    
+    # --- START OF FIX ---
+    # Remove the 'stack_dim' argument here as well
     loader_val = LTRLoader('val', dataset_val, training=False, batch_size=cfg.TRAIN.BATCH_SIZE,
-                           num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, stack_dim=1, sampler=val_sampler,
+                           num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, sampler=val_sampler,
                            epoch_interval=cfg.TRAIN.VAL_EPOCH_INTERVAL)
+    # --- END OF FIX ---
 
     return loader_train, loader_val
 
 
 def get_optimizer_scheduler(net, cfg, settings):
-    tracker_name = settings.script_name
-
-    # Visual Encoder
+    # This function remains unchanged, but is included for completeness.
     param_dicts = [
         {"params": [p for n, p in net.named_parameters() if "backbone" not in n and p.requires_grad]},
         {

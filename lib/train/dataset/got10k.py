@@ -9,7 +9,6 @@ from collections import OrderedDict
 from .base_video_dataset import BaseVideoDataset
 from lib.train.data import jpeg4py_loader
 from lib.train.admin import env_settings
-from torchvision.transforms.functional import to_tensor
 
 
 class Got10k(BaseVideoDataset):
@@ -185,19 +184,3 @@ class Got10k(BaseVideoDataset):
             anno_frames[key] = [value[f_id, ...].clone() for f_id in frame_ids]
 
         return frame_list, anno_frames, obj_meta
-
-    def get_search_frames(self, seq_id, frame_ids):
-        # Get the processed search frames and their annotations
-        search_frames, search_anno, obj_meta = self.get_frames(seq_id, frame_ids)
-
-        # Also load the raw, unprocessed versions of each search frame
-        seq_path = self._get_sequence_path(seq_id)
-        raw_search_frames = []
-        for f_id in frame_ids:
-            raw_img = self.image_loader(self._get_frame_path(seq_path, f_id))
-            raw_search_frames.append(to_tensor(raw_img))
-        
-        # Add the list of raw frames to the annotation dictionary
-        search_anno['raw_search_frames'] = raw_search_frames
-
-        return search_frames, search_anno, obj_meta
