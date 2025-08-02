@@ -38,12 +38,20 @@ cfg.MODEL.HEAD.NUM_CHANNELS = 256
 
 cfg.MODEL.APN = edict()
 cfg.MODEL.APN.USE = True
+
+cfg.MODEL.APN.CONFIDENCE_THRESHOLD = 0.3
+
 #Add Dora config
 cfg.MODEL.APN.DORA_ARCH = 'vit_small' # 'vit_tiny', 'vit_small', 'vit_base'
 cfg.MODEL.APN.DORA_PATCH_SIZE = 16
 cfg.MODEL.APN.DORA_WEIGHTS_PATH = "/home/elgazwy/OD_track_encoder_decoder/ODTrack/lib/models/dora/checkpoint.pth" # IMPORTANT: Update this path
 cfg.MODEL.APN.NUM_OBJECT_QUERIES = 1 # Number of objects DoRA will try to discover
-
+# --- START OF MODIFICATION ---
+cfg.MODEL.APN.PROTOTYPE_STRATEGY = 'last' # Options: 'first', 'last', 'average'
+cfg.MODEL.APN.CONFIDENCE_THRESHOLD = 0.3
+cfg.MODEL.APN.BACKGROUND_SUPPRESSION = False
+cfg.MODEL.APN.CROPPING_SCHEME = 'center_of_mass' # Options: 'sliding_window', 'center_of_mass'
+# --- END OF MODIFICATION ---
 # cfg.MODEL.APN.EMBED_DIM = 512
 # cfg.MODEL.APN.PATCH_SIZE = 16
 # cfg.MODEL.APN.DROPOUT = 0.1
@@ -112,6 +120,7 @@ cfg.DATA.TEMPLATE.FACTOR = 2.0
 cfg.DATA.TEMPLATE.CENTER_JITTER = 0
 cfg.DATA.TEMPLATE.SCALE_JITTER = 0
 cfg.DATA.TEMPLATE.NUM_HISTORY = 3
+cfg.DATA.TEMPLATE.MAX_TOTAL_TEMPLATES = 4
 # TEST
 cfg.TEST = edict()
 cfg.TEST.TEMPLATE_FACTOR = 2.0

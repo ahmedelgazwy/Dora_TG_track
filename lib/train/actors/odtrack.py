@@ -6,6 +6,7 @@ import torch
 import os
 import torchvision
 from torchvision.transforms.functional import crop, resize
+from torchvision.utils import draw_bounding_boxes
 from pathlib import Path
 import matplotlib.cm as cm
 import numpy as np
@@ -22,7 +23,7 @@ class ODTrackActor(BaseActor):
         self.bs = self.settings.batchsize
         self.cfg = cfg
         self.iter = 0
-        self.viz_interval = 200
+        self.viz_interval = 1875
 
         if settings.local_rank in [-1, 0]:
             self.viz_dir = Path(self.settings.env.workspace_dir) / "viz_apn"
@@ -49,11 +50,6 @@ class ODTrackActor(BaseActor):
         search_list_raw = [data['search_images_raw'][:, i, ...] for i in range(num_search_frames)]
         
         template_anno_list = [data['template_anno'][:, i, ...] for i in range(num_template_frames)]
-
-        # --- START OF MODIFICATION ---
-        # Note: CE logic is complex and often disabled. It is removed here for clarity.
-        # If you need it, it should be re-integrated carefully.
-        # --- END OF MODIFICATION ---
 
         out_dict = self.net(template=template_list,
                             search=search_list,
@@ -94,8 +90,10 @@ class ODTrackActor(BaseActor):
                     f"{i}frame_Loss/total": loss.item(),
                     f"{i}frame_Loss/giou": loss_dict.get('giou', torch.tensor(0.0)).item(),
                     f"{i}frame_Loss/l1": loss_dict.get('l1', torch.tensor(0.0)).item(),
-                    f"{i}frame_IoU": iou.detach().mean().item()
+                    f"{i}frame_IoU": iou.detach().mean().item(),
                 }
+                if 'apn_confidence' in pred_dict[i]:
+                    status[f"{i}frame_APN_Confidence"] = pred_dict[i]['apn_confidence'].mean().item()
                 total_status.update(status)
         
         if return_status:
@@ -114,46 +112,72 @@ class ODTrackActor(BaseActor):
         i = 0
         b = 0
 
-        if 'predicted_template' not in pred_dict[i] or 'upsampled_mask' not in pred_dict[i]:
+        # --- START OF MODIFICATION: Remove check for 'template_mask' ---
+        if 'predicted_template' not in pred_dict[i] or 'upsampled_mask' not in pred_dict[i] or 'templates_used' not in pred_dict[i]:
+        # --- END OF MODIFICATION ---
             return
 
         viz_size = (224, 224)
         
-        # --- START OF MODIFICATION ---
-        # 1. FIX PADDING: Select the FIRST template, which is never a padding frame.
-        input_template_norm = gt_dict['template_images'][b, 0, ...].unsqueeze(0)
-        # --- END OF MODIFICATION ---
+        viz_grid = []
+        templates_used_norm = pred_dict[i]['templates_used']
+        num_gt_templates = gt_dict['template_images'].shape[1]
 
-        search_frame_norm = gt_dict['search_images_raw'][b, i, ...].unsqueeze(0)
-        predicted_template_norm = pred_dict[i]['predicted_template'][b].unsqueeze(0)
+        for t_idx, t_norm in enumerate(templates_used_norm):
+            img = ((t_norm[b].unsqueeze(0) * self.std) + self.mean).clamp(0, 1).cpu().squeeze(0)
+            img_resized = resize(img, viz_size)
+            
+            img_uint8 = (img_resized * 255).to(torch.uint8)
+            
+            if t_idx < num_gt_templates:
+                gt_anno_norm = gt_dict['template_anno'][b, t_idx, :]
+                box_xyxy = box_xywh_to_xyxy(gt_anno_norm).cpu()
+                box_unnorm = box_xyxy * torch.tensor([viz_size[1], viz_size[0], viz_size[1], viz_size[0]], dtype=torch.float32)
+                img_with_box = draw_bounding_boxes(img_uint8, box_unnorm.unsqueeze(0), colors="red", width=2)
+            else:
+                full_frame_box = torch.tensor([0, 0, viz_size[1]-1, viz_size[0]-1], dtype=torch.float32).unsqueeze(0)
+                img_with_box = draw_bounding_boxes(img_uint8, full_frame_box, colors="green", width=2)
+            
+            viz_grid.append(img_with_box.to(torch.float32) / 255.0)
         
-        # Denormalize all images before display
-        input_template = ((input_template_norm * self.std) + self.mean).clamp(0, 1).cpu()
-        search_frame = ((search_frame_norm * self.std) + self.mean).clamp(0, 1).cpu()
-        predicted_template = ((predicted_template_norm * self.std) + self.mean).clamp(0, 1).cpu()
+        # --- START OF MODIFICATION: Remove the 'template_mask' visualization logic ---
+        # The following block is now removed.
+        # template_mask = pred_dict[i]['template_mask'][b].cpu()
+        # template_mask_heatmap = self.tensor_to_colormap(template_mask, cmap_name='inferno')
+        # template_with_mask = (first_gt_template_img * 0.4 + template_mask_heatmap * 0.6)
+        # viz_grid.append(resize(template_with_mask, viz_size))
+        # --- END OF MODIFICATION ---
+        
+        search_frame_norm = gt_dict['search_images_raw'][b, i, ...].unsqueeze(0)
+        search_frame = search_frame_norm.clamp(0, 1).cpu()
+        
+        predicted_template_norm = pred_dict[i]['predicted_template'][b].unsqueeze(0)
+        predicted_template = predicted_template_norm.clamp(0, 1).cpu()
 
         upsampled_mask = pred_dict[i]['upsampled_mask'][b].unsqueeze(0)
-        # 2. FIX PALE MASK: Convert the mask to a colorful heatmap
         mask_heatmap = self.tensor_to_colormap(upsampled_mask)
-        
-        search_frame_with_mask = (search_frame.squeeze(0) * 0.4 + mask_heatmap * 0.6)
+        search_frame_with_mask = (search_frame.squeeze(0) * 0.4 + mask_heatmap * 0.6).unsqueeze(0)
 
         gt_bbox_xywh = gt_dict['search_anno'][b, i, ...]
         search_image_gt_processed = gt_dict['search_images'][b, i, ...].unsqueeze(0)
         search_image_gt_denorm = ((search_image_gt_processed * self.std) + self.mean).clamp(0, 1).cpu()
         
         img_h, img_w = search_image_gt_denorm.shape[-2:]
-        gt_bbox_abs = box_xywh_to_xyxy(gt_bbox_xywh.cpu()) * torch.tensor([img_w, img_h, img_w, img_w]) # Typo fixed
-        gt_crop = crop(search_image_gt_denorm.squeeze(0), int(gt_bbox_abs[1]), int(gt_bbox_abs[0]), int(gt_bbox_abs[3]-gt_bbox_abs[1]), int(gt_bbox_abs[2]-gt_bbox_abs[0]))
+        gt_bbox_abs = box_xywh_to_xyxy(gt_bbox_xywh.cpu()) * torch.tensor([img_w, img_h, img_w, img_h])
         
-        viz_grid = [
-            resize(img.squeeze(0), viz_size) for img in 
-            [input_template, search_frame, predicted_template]
-        ]
-        viz_grid.insert(2, resize(search_frame_with_mask, viz_size))
-        viz_grid.append(resize(gt_crop, viz_size))
+        x1, y1, x2, y2 = gt_bbox_abs[0], gt_bbox_abs[1], gt_bbox_abs[2], gt_bbox_abs[3]
+        gt_crop = crop(search_image_gt_denorm.squeeze(0), int(y1), int(x1), int(y2 - y1), int(x2 - x1))
+        
+        num_templates = len(templates_used_norm)
+        max_templates_cfg = self.cfg.DATA.TEMPLATE.get("MAX_TOTAL_TEMPLATES", 3)
+        if num_templates < max_templates_cfg:
+            viz_grid.extend([torch.ones(3, *viz_size)] * (max_templates_cfg - num_templates))
 
-        filepath = self.viz_dir / f"epoch_{gt_dict['epoch']}_iter_{self.iter}.png"
-        # 3. FIX WASHED-OUT IMAGES: Save without re-normalizing
-        torchvision.utils.save_image(torch.stack(viz_grid), filepath, nrow=5)
-    # --- END OF MODIFICATION ---
+        main_viz_components = [search_frame, search_frame_with_mask, predicted_template, gt_crop.unsqueeze(0)]
+        viz_grid.extend([resize(img.squeeze(0), viz_size) for img in main_viz_components])
+
+        confidence = pred_dict[i]['apn_confidence'][b].item()
+        filepath = self.viz_dir / f"epoch_{gt_dict['epoch']}_iter_{self.iter}_conf_{confidence:.3f}.png"
+        
+        # Adjust nrow for the removed template mask image
+        torchvision.utils.save_image(torch.stack(viz_grid), filepath, nrow=max_templates_cfg + 4)

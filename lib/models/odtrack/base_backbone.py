@@ -77,7 +77,7 @@ class BaseBackbone(nn.Module):
         template_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
                                                              align_corners=False)
         template_patch_pos_embed = template_patch_pos_embed.flatten(2).transpose(1, 2)
-
+        print("template_patch_pos_embed",template_patch_pos_embed.shape)
         self.pos_embed_z = nn.Parameter(template_patch_pos_embed)
         self.pos_embed_x = nn.Parameter(search_patch_pos_embed)
 
@@ -104,12 +104,10 @@ class BaseBackbone(nn.Module):
 
         x = self.patch_embed(x)
         
-        # This handles both a single tensor and a list of tensors for z
-        if isinstance(z, list):
-            z_list = [self.patch_embed(z_i) for z_i in z]
-            z = torch.cat(z_list, dim=1)
-        else:
-            z = self.patch_embed(z)
+        z = torch.stack(z, dim=1)
+        _, T_z, C_z, H_z, W_z = z.shape
+        z = z.flatten(0, 1)
+        z = self.patch_embed(z)
 
         if self.add_cls_token:
             if token_type == "concat":
@@ -117,8 +115,8 @@ class BaseBackbone(nn.Module):
                 query = new_query if track_query is None else torch.cat([new_query, track_query], dim=1)
                 query = query + self.cls_pos_embed
             elif token_type == "add":
-                query = self.cls_token if track_query is None else track_query + self.cls_token
-                query = query.expand(B, -1, -1)
+                query = self.cls_token if track_query is None else track_query + self.cls_token   # self.cls_token is init query
+                query = query.expand(B, -1, -1)  # copy B times
                 query = query + self.cls_pos_embed
 
         z = z + self.pos_embed_z
@@ -127,26 +125,29 @@ class BaseBackbone(nn.Module):
         if self.add_sep_seg:
             x += self.search_segment_pos_embed
             z += self.template_segment_pos_embed
+
+        if T_z > 1:  # multiple memory frames
+            z = z.view(B, T_z, -1, z.size()[-1]).contiguous()
+            z = z.flatten(1, 2)
         
-        lens_z = z.shape[1]
-        lens_x = x.shape[1]
-        x = combine_tokens(z, x, mode=self.cat_mode)
+        lens_z = z.shape[1]  # HW
+        lens_x = x.shape[1]  # HW
+        x = combine_tokens(z, x, mode=self.cat_mode)  # (B, z+x, 768)
         if self.add_cls_token:
-            x = torch.cat([query, x], dim=1)
+            x = torch.cat([query, x], dim=1)     # (B, 1+z+x, 768)
 
         x = self.pos_drop(x)
 
         for i, blk in enumerate(self.blocks):
             x, attn = blk(x, lens_z, lens_x, return_attention=True)
         
-        new_lens_z = z.shape[1]
-        new_lens_x = x.shape[1] # Note: this is incorrect if tokens are recovered, but not used later
+        new_lens_z = z.shape[1]  # HW
+        new_lens_x = x.shape[1]  # HW
         x = recover_tokens(x, new_lens_z, new_lens_x, mode=self.cat_mode)
 
         aux_dict = {"attn": attn}
         
         return self.norm(x), aux_dict
-
     # --- START OF FIX ---
     def forward(self, z, x, **kwargs):
         """
